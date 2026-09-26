@@ -697,7 +697,7 @@ void checkWeather() {
       String currentWeatherPayload = http.getString();
       Serial.println("weather checked");
 
-      DynamicJsonDocument currentDoc(1024);
+      JsonDocument currentDoc;
       DeserializationError error = deserializeJson(currentDoc, currentWeatherPayload);
 
       if (error) {
@@ -747,7 +747,7 @@ void sendWeatherInfo() {
     if (httpCode > 0) {
       String payload = http.getString();
 
-      DynamicJsonDocument doc(2048);
+      JsonDocument doc;
       DeserializationError error = deserializeJson(doc, payload);
 
       if (!error) {
@@ -794,7 +794,7 @@ void sendForecastInfo() {
       String payload = http.getString();
 
       // ArduinoJson filter reduces memory needed from 30,000 bytes down to ~4KB
-      StaticJsonDocument<512> filter;
+      JsonDocument filter;
       filter["location"]["name"] = true;
       filter["location"]["country"] = true;
       filter["forecast"]["forecastday"][0]["date"] = true;
@@ -814,7 +814,7 @@ void sendForecastInfo() {
       hour["temp_f"] = true;
       hour["precip_mm"] = true;
 
-      DynamicJsonDocument doc(4096);
+      JsonDocument doc;
       DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
 
       if (error) {
@@ -924,7 +924,7 @@ void handleReceiveData() {
     String body = server.arg("plain");
     Serial.println("ESP32 received data: " + body);
 
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, body);
 
     if (!error) {
@@ -1036,5 +1036,4 @@ void logEvent(String code, String description) {
   } else {
     Serial.println("WiFi not connected");
   }
-}
 }
