@@ -1,0 +1,16 @@
+# Secrets and sensitive configuration
+secrets.h
+.env
+.env.*
+!.env.example
+!secrets.h.example
+
+# Build and IDE files
+*.hex
+*.bin
+*.elf
+.vscode/
+.idea/
+*.swp
+*~
+

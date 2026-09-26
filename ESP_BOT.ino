@@ -1,10 +1,11 @@
 //////////////// Libraries
+#include "secrets.h"
 #include <WiFiManager.h>  // WiFiManager for WiFi configuration
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <ArduinoOTA.h>
-#include <UrlEncode.h>
 #include <Arduino.h>
 #include <EEPROM.h>
 #include "freertos/FreeRTOS.h"
@@ -19,27 +20,42 @@
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 
-
+// Forward declarations
+void scanDevices();
+void handleNewMessages(int newMessages);
+void sendWelcomeMessage();
+void connectToWiFi();
+void resetWiFiSettings();
+void checkWeather();
+void sendWeatherInfo();
+void sendForecastInfo();
+String customUrlEncode(const String &str);
+void sendDataToESP8266();
+void handleReceiveData();
+void sendMessageTelegram(String message);
+void sendMessageWhatsApp(String message);
+void updateBlink();
+void updateBlynkSwitch(String virtualPin, int value);
+void logEvent(String code, String description);
+void printWakeUpReason();
 
 // NTP Server
 const char* ntpServer = "pool.ntp.org";
 const long utcOffsetInSeconds = 19800; // Offset for UTC+5:30
-// Create instances
 WiFiUDP udp;
 NTPClient timeClient(udp, ntpServer, utcOffsetInSeconds);
 
-
 WiFiManager wifiManager;
-const char* targetDevice1 = "ff:a1:a0:02:d3:c7";
-const char* targetDevice2 = "c1:a1:b2:2b:1c:46";
-const char* targetDevice3 = "6b:a4:87:68:03:af";
+const char* targetDevice1 = TARGET_BLE_DEVICE_1;
+const char* targetDevice2 = TARGET_BLE_DEVICE_2;
+const char* targetDevice3 = TARGET_BLE_DEVICE_3;
 
 // Last state of device detection
 bool device1LastState = false;
 bool device2LastState = false;
 bool device3LastState = false;
 bool isScanningActive = false;
-NimBLEScan* pBLEScan;
+NimBLEScan* pBLEScan = nullptr;
 
 // RSSI Threshold for 3 meters (approx)
 const int RSSI_THRESHOLD = -75;  // Adjust this based on testing
@@ -53,40 +69,35 @@ TaskHandle_t task2TaskHandle = NULL;
 TaskHandle_t task3TaskHandle = NULL;
 
 void scanDevices() {
+  if (!pBLEScan) return;
 
-  NimBLEScanResults foundDevices = pBLEScan->start(5, false);
+  // Scan for 3 seconds (passive scan allows WiFi packets to co-exist)
+  pBLEScan->start(3, false);
+  NimBLEScanResults foundDevices = pBLEScan->getResults();
   int count = foundDevices.getCount();
 
   for (int i = 0; i < count; i++) {
-    NimBLEAdvertisedDevice advertisedDevice = foundDevices.getDevice(i);
-    String address = advertisedDevice.getAddress().toString().c_str();
-    int rssi = advertisedDevice.getRSSI();
-    Serial.println(rssi);
+    const NimBLEAdvertisedDevice* advertisedDevice = foundDevices.getDevice(i);
+    String address = advertisedDevice->getAddress().toString().c_str();
+    int rssi = advertisedDevice->getRSSI();
 
     // Only consider devices within RSSI_THRESHOLD (approx. 3 meters)
     if (rssi > RSSI_THRESHOLD) {
-      
       // Check for Device 1
       if (address == targetDevice1) {
         if (!device1LastState) {
           device1LastState = true;
           EEPROM.write(DEVICE1_ADDR, device1LastState);
           EEPROM.commit();
-          vTaskSuspend(task1TaskHandle);
-          vTaskSuspend(task3TaskHandle);
           Serial.println("Venuja is at Door");
           sendMessageWhatsApp("Venuja is at Door");
           logEvent("motion_sense", "Venuja is at Door");
-          vTaskResume(task1TaskHandle);
-          vTaskResume(task3TaskHandle);
         }
       } else if (device1LastState) {
-        // If the device was previously detected but is now below the threshold
         device1LastState = false;
         EEPROM.write(DEVICE1_ADDR, device1LastState);
         EEPROM.commit();
         Serial.println("Venuja has left the Door");
-
       }
 
       // Check for Device 2
@@ -95,13 +106,9 @@ void scanDevices() {
           device2LastState = true;
           EEPROM.write(DEVICE2_ADDR, device2LastState);
           EEPROM.commit();
-          vTaskSuspend(task1TaskHandle);
-          vTaskSuspend(task3TaskHandle);
           Serial.println("Sanija is at Door");
           sendMessageWhatsApp("Sanija is at Door");
           logEvent("motion_sense", "Sanija is at Door");
-          vTaskResume(task1TaskHandle);
-          vTaskResume(task3TaskHandle);
         }
       } else if (device2LastState) {
         device2LastState = false;
@@ -116,13 +123,9 @@ void scanDevices() {
           device3LastState = true;
           EEPROM.write(DEVICE3_ADDR, device3LastState);
           EEPROM.commit();
-          vTaskSuspend(task1TaskHandle);
-          vTaskSuspend(task3TaskHandle);
           Serial.println("Athula is at Door");
           sendMessageWhatsApp("Athula is at Door");
           logEvent("motion_sense", "Athula is at Door");
-          vTaskResume(task1TaskHandle);
-          vTaskResume(task3TaskHandle);
         }
       } else if (device3LastState) {
         device3LastState = false;
@@ -159,72 +162,50 @@ void scanDevices() {
   pBLEScan->clearResults();
 }
 
-
-
-
-
 // I2C address of the ESP32
 #define ESP32_ADDR 0x08
-/////////////////////////////////////////////////////////////
 
-////////////////  pins   ////////////////////////////
-#define BOOT_BUTTON_PIN 0  //GPIO pin for BOOT button (GPIO 0)
-//////////////////////////////////////////////////////
+// Pins
+#define BOOT_BUTTON_PIN 0  // GPIO pin for BOOT button (GPIO 0)
+#define LED_PIN 2          // Usually onboard LED is connected to GPIO 2
 
-
-////////////////// Battery stats
-//Battery18650Stats batteryStats(33, 3.3, 50);  // ADC pin, conversion factor, reads
-/////////////////////////////////////////////////////////////
-
-
-///////////// Telegram Bot Code
-#define BOTtoken ""
-#define CHAT_ID ""
+// Telegram Bot Code
 WiFiClientSecure client;
-UniversalTelegramBot bot(BOTtoken, client);
-////////////////////////////////////////////////////////
+UniversalTelegramBot bot(BOT_TOKEN, client);
 
-
-////////// weather API
-const char* city = "";  // Replace with your city coordinates
+// Weather API
+const char* city = WEATHER_CITY;
 const char* weatherApiUrl = "http://api.weatherapi.com/v1/current.json";
 const char* forecastApiUrl = "http://api.weatherapi.com/v1/forecast.json";
-const char* weatherApiKey = "";
-////////////////////////////////////////////////////////////////////////////
+const char* weatherApiKey = WEATHER_API_KEY;
 
-//////////////whatsapp api
-String MobileNumber = "";
-String APIKey = "";
-////////////////////////////////////////////////////////
+// WhatsApp API
+String MobileNumber = WHATSAPP_MOBILE_NUMBER;
+String APIKey = WHATSAPP_API_KEY;
 
-const char* serverIP = "192.168.1.188";  // Replace with the ESP32 IP address
-const int port = 80;                        // HTTP port
+// Peer ESP server & local WebServer
+const char* serverIP = PEER_SERVER_IP;
+const int port = PEER_SERVER_PORT;
 WebServer server(80);
 
-//////////////////////////////////////////////
+// Static IP Network
+IPAddress staticIP = STATIC_IP;
+IPAddress gateway = GATEWAY_IP;
+IPAddress subnet = SUBNET_MASK;
+IPAddress primaryDNS = PRIMARY_DNS;
+IPAddress secondaryDNS = SECONDARY_DNS;
 
-IPAddress staticIP(192, 168, 1, 184);  // Static IP
-IPAddress gateway(192, 168, 1, 1);     // Gateway IP
-IPAddress subnet(255, 255, 255, 0);    // Subnet mask
-IPAddress primaryDNS(8, 8, 8, 8);      // Optional: DNS server
-IPAddress secondaryDNS(8, 8, 4, 4);    // Optional: secondary DNS
-
-///////booleans
+// Booleans & Timers
 unsigned long resetButtonPressTime = 0;
 bool resetInProgress = false;
-bool otaInProgress = false;  // Track if OTA is in progress
+bool otaInProgress = false;
 bool raining = false;
-//bool rainForecasted = false;
 unsigned long lastWeatherCheck = 0;
-unsigned long weatherCheckInterval = 600000;  // 10 minutes (600,000 ms)
-unsigned long lastTimeBotRan;
+unsigned long weatherCheckInterval = 600000;  // 10 minutes
+unsigned long lastTimeBotRan = 0;
 bool wasRestarted = false;
-/////////////////////////////////////////////////
 
-
-
-//////// Integers
-////////////////////////////////////////////////////////////////
+// Integers & States
 int motionsense = 0;
 int temperature = 0;
 int humidity = 0;
@@ -238,44 +219,44 @@ int batteryswitch = 0;
 int motionswitch = 0;
 int weatherswitch = 0;
 int scanswitch = 1;
-int lastsleep = 0;  // Variable to track the last message ID
-int distance;
-int sonarTriggerThreshold = 100;  // Distance threshold in cm for object detection by sonar sensor
-long duration;
+int lastsleep = 0;
+int distance = 0;
+int sonarTriggerThreshold = 100;
+long duration = 0;
 int chargeLevel = 0;
 float voltage = 0;
-////////////////////////////////////////////////////////////////
 
-
-//////Definitions
-///////////////////////////////////////////////////////
-#define LED_PIN 2  // Usually onboard LED is connected to GPIO 2
-// Define temperature threshold
+// Definitions
 #define TEMPERATURE_THRESHOLD 95.0
-// Define deep sleep duration (5 minutes in microseconds)
 #define DEEP_SLEEP_DURATION 300000000  // 5 minutes
-// EEPROM address to store the last message ID
 #define SLEEPADDR 6
-// EEPROM size
 #define EEPROM_SIZE 512
 #define tf 1000000
-//////////////////////////////////////////////////////////
 
+// Non-blocking LED state tracking
+unsigned long lastBlinkToggle = 0;
+bool ledState = false;
 
+void updateBlink() {
+  unsigned long now = millis();
+  if (ledState && (now - lastBlinkToggle >= 200)) {
+    digitalWrite(LED_PIN, LOW);
+    ledState = false;
+    lastBlinkToggle = now;
+  } else if (!ledState && (now - lastBlinkToggle >= 600)) {
+    digitalWrite(LED_PIN, HIGH);
+    ledState = true;
+    lastBlinkToggle = now;
+  }
+}
 
-
-//TaskHandle_t task4TaskHandle = NULL;
-//volatile bool heartbeat1Received = false;
-//volatile bool heartbeatReceived = false;
-
+// Telegram polling task (Core 0)
 void task1(void* pvParameters) {
   UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(NULL);
-    Serial.println("Task1 remaining stack space: " + String(highWaterMark*4/1024));
+  Serial.println("Task1 remaining stack space: " + String(highWaterMark * 4 / 1024) + " KB");
 
-  
   while (true) {
-
-    if (millis() > lastTimeBotRan + botRequestDelay) {
+    if (millis() - lastTimeBotRan > (unsigned long)botRequestDelay) {
       int newMessages = bot.getUpdates(bot.last_message_received + 1);
       while (newMessages) {
         handleNewMessages(newMessages);
@@ -283,42 +264,46 @@ void task1(void* pvParameters) {
       }
       lastTimeBotRan = millis();
     }
-
-    //Serial.println("task1 running smoothly");
-    delay(100);  // Simulate work
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
+// BLE Scanner Task (Core 1)
 void task2(void* pvParameters) {
   UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(NULL);
-    Serial.println("Task2 remaining stack space: " + String(highWaterMark*4/1024));
+  Serial.println("Task2 remaining stack space: " + String(highWaterMark * 4 / 1024) + " KB");
+
   while (true) {
-   
-      if (isScanningActive) {
-        Serial.println("scanning devices");
-    scanDevices();
-  }
-    //Serial.println("task 2 running smoothly");
+    if (isScanningActive) {
+      Serial.println("scanning devices");
+      scanDevices();
+      // Rest pause between scans to allow WiFi radio coexistence
+      vTaskDelay(pdMS_TO_TICKS(1500));
+    } else {
+      // Must yield CPU when inactive to prevent TWDT starvation on Core 1
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
   }
 }
 
+// Periodic Weather Check Task (Core 0)
 void checkWeatherTask(void* parameter) {
   while (true) {
     checkWeather();
-    vTaskDelay(100000 / portTICK_PERIOD_MS);  // Delay for 20 seconds
+    vTaskDelay(pdMS_TO_TICKS(100000));  // Check every 100 seconds
   }
 }
+
+// Web Server and OTA Task (Core 0)
 void task3(void* pvParameters) {
   UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(NULL);
-    Serial.println("Task3 remaining stack space: " + String(highWaterMark*4/1024));
+  Serial.println("Task3 remaining stack space: " + String(highWaterMark * 4 / 1024) + " KB");
 
-   while (true) {
-//Serial.println("Task3 running");
-     
- server.handleClient();
-    ArduinoOTA.handle();  // Handle OTA events
+  while (true) {
+    server.handleClient();
+    ArduinoOTA.handle();
 
-      // Check BOOT button state for WiFi reset (only if OTA is not in progress)
+    // Check BOOT button state for WiFi reset
     if (!otaInProgress) {
       if (digitalRead(BOOT_BUTTON_PIN) == LOW && !resetInProgress) {
         resetInProgress = true;
@@ -327,153 +312,132 @@ void task3(void* pvParameters) {
 
       if (resetInProgress && digitalRead(BOOT_BUTTON_PIN) == HIGH) {
         if (millis() - resetButtonPressTime > 5000) {
-          resetWiFiSettings();  // Reset WiFi credentials if button is held for more than 5 seconds
-          ESP.restart();        // Restart the ESP
+          resetWiFiSettings();
+          ESP.restart();
         }
         resetInProgress = false;
       }
     } else {
-      if (otaInProgress) { blink(); }
-    }}}
-/////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////
+      updateBlink();
+    }
+
+    // Crucial yield so Core 0 IDLE task can feed the watchdog
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
 
 void setup() {
-  Serial.begin(9600);
-  Serial.println("Configuring Device...");
-  // Initialize EEPROM
+  Serial.begin(115200);
+  Serial.println("\nConfiguring Device...");
+
   printWakeUpReason();
   pinMode(LED_PIN, OUTPUT);
-  blink();
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(LED_PIN, LOW);
+
+  // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
-  motionswitch = EEPROM.read(7);  // Use global variables
+  motionswitch = EEPROM.read(7);
   sonarswitch = EEPROM.read(8);
   batteryswitch = EEPROM.read(9);
   weatherswitch = EEPROM.read(10);
   voltage = EEPROM.read(90);
   pm = EEPROM.read(70);
-  raining = EEPROM.read(11);  // Read the previous state from EEPROM
-  raining = (raining == 1);   // Convert byte to boolean
-  //rainForecasted = EEPROM.read(11);  // Read the previous state from EEPROM
-  //rainForecasted = (rainForecasted == 1);
+  raining = (EEPROM.read(11) == 1);
   device1LastState = EEPROM.read(DEVICE1_ADDR);
   device2LastState = EEPROM.read(DEVICE2_ADDR);
   device3LastState = EEPROM.read(DEVICE3_ADDR);
   isScanningActive = EEPROM.read(60);
   scanswitch = EEPROM.read(80);
+
   Serial.println("Loaded states from EEPROM:");
   Serial.printf("Device1: %s\n", device1LastState ? "Arrived" : "Left");
   Serial.printf("Device2: %s\n", device2LastState ? "Arrived" : "Left");
   Serial.printf("Device3: %s\n", device3LastState ? "Arrived" : "Left");
   Serial.printf("isScanningActive: %s\n", isScanningActive ? "Active" : "Deactive");
 
-  // Retrieve the last message ID from EEPROM
   lastsleep = EEPROM.read(SLEEPADDR);
   Serial.print("Last sleep status: ");
   Serial.println(lastsleep);
+
   connectToWiFi();
 
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  pinMode(LED_PIN, OUTPUT);
-  blink();
-  // Start OTA
+
+  // Configure ArduinoOTA
   ArduinoOTA.begin();
   ArduinoOTA.onStart([]() {
     otaInProgress = true;
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else {
-      type = "filesystem";
-    }
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
     Serial.println("OTA Update Start: " + type);
   });
 
   ArduinoOTA.onEnd([]() {
-    Serial.println("OTA Update Finished");
+    Serial.println("\nOTA Update Finished");
   });
 
   ArduinoOTA.onError([](ota_error_t error) {
     String errorMessage;
     switch (error) {
-      case OTA_AUTH_ERROR: errorMessage = "OTA Auth Failed"; break;
-      case OTA_BEGIN_ERROR: errorMessage = "OTA Begin Failed"; break;
+      case OTA_AUTH_ERROR:    errorMessage = "OTA Auth Failed"; break;
+      case OTA_BEGIN_ERROR:   errorMessage = "OTA Begin Failed"; break;
       case OTA_CONNECT_ERROR: errorMessage = "OTA Connect Failed"; break;
       case OTA_RECEIVE_ERROR: errorMessage = "OTA Receive Failed"; break;
-      case OTA_END_ERROR: errorMessage = "OTA End Failed"; break;
+      case OTA_END_ERROR:     errorMessage = "OTA End Failed"; break;
     }
     Serial.println("OTA Error: " + errorMessage);
   });
 
   sendWelcomeMessage();
+
   server.on("/data", HTTP_POST, handleReceiveData);
   server.begin();
   Serial.println("ESP32 HTTP server started");
   sendDataToESP8266();
 
+  // Initialize NimBLE with balanced parameters for WiFi coexistence
   NimBLEDevice::init("ESP32_BLE_Scanner");
   pBLEScan = NimBLEDevice::getScan();
-  pBLEScan->setActiveScan(true);  // Active scan to get device name
-  pBLEScan->setInterval(100);     // Interval for BLE scanning
-  pBLEScan->setWindow(99);        // Window for BLE scanning
-                                  // Create the Core 1 monitoring task
-  Serial.println("setup succeed and starting loop");
+  pBLEScan->setActiveScan(false);  // Passive scan minimizes transmission collisions
+  pBLEScan->setInterval(160);      // Interval in ms
+  pBLEScan->setWindow(80);         // 50% duty cycle allows WiFi radio time
 
-  xTaskCreatePinnedToCore(task2, "task2", 5000, NULL, 1, &task2TaskHandle, 1);
+  Serial.println("Setup succeeded; launching FreeRTOS tasks...");
 
-  xTaskCreatePinnedToCore(task1, "task1", 5000, NULL, 1, &task1TaskHandle, 0);
+  // Task 2: BLE scanning pinned to Core 1
+  xTaskCreatePinnedToCore(task2, "task2", 6144, NULL, 1, &task2TaskHandle, 1);
 
-  xTaskCreatePinnedToCore(task3, "task3", 4000, NULL, 1, &task3TaskHandle, 0);
+  // Task 1: Telegram Bot pinned to Core 0 (increased stack for TLS)
+  xTaskCreatePinnedToCore(task1, "task1", 8192, NULL, 1, &task1TaskHandle, 0);
 
+  // Task 3: Web Server & OTA pinned to Core 0
+  xTaskCreatePinnedToCore(task3, "task3", 6144, NULL, 1, &task3TaskHandle, 0);
 
-  xTaskCreatePinnedToCore(
-    checkWeatherTask,  // Task function
-    "CheckWeather",    // Task name
-    5000,              // Stack size
-    NULL,              // Task input parameter
-    1,                 // Priority
-    NULL,              // Task handle
-    0                  // Pin to core 1
-  );
-  blink();
-   timeClient.begin();
+  // Task 4: Weather check pinned to Core 0
+  xTaskCreatePinnedToCore(checkWeatherTask, "CheckWeather", 8192, NULL, 1, NULL, 0);
+
+  timeClient.begin();
   checkWeather();
 }
 
-
 void printWakeUpReason() {
-  esp_sleep_wakeup_cause_t wakeup_reason;
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_TIMER:
-      Serial.println("Wakeup caused by timer");
-      break;
-    case ESP_SLEEP_WAKEUP_EXT0:
-      Serial.println("Wakeup caused by external signal using RTC_IO");
-      break;
-    case ESP_SLEEP_WAKEUP_EXT1:
-      Serial.println("Wakeup caused by external signal using RTC_CNTL");
-      break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD:
-      Serial.println("Wakeup caused by touchpad");
-      break;
-    case ESP_SLEEP_WAKEUP_ULP:
-      Serial.println("Wakeup caused by ULP program");
-      break;
-    default:
-      Serial.println("Normal startup and not caused by deep sleep");
-      break;
+    case ESP_SLEEP_WAKEUP_TIMER:    Serial.println("Wakeup caused by timer"); break;
+    case ESP_SLEEP_WAKEUP_EXT0:     Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case ESP_SLEEP_WAKEUP_EXT1:     Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD: Serial.println("Wakeup caused by touchpad"); break;
+    case ESP_SLEEP_WAKEUP_ULP:      Serial.println("Wakeup caused by ULP program"); break;
+    default:                        Serial.println("Normal startup and not caused by deep sleep"); break;
   }
 }
 
-
 void loop() {
+  updateBlink();
 
-  blink();
   float inttemperature = temperatureRead();
-  //Serial.println(inttemperature);
+
   if (inttemperature > TEMPERATURE_THRESHOLD && !otaInProgress) {
     Serial.println("Temperature exceeds threshold! Going to deep sleep...");
     sendMessageTelegram("Device over heated and starting deep sleep");
@@ -481,40 +445,34 @@ void loop() {
     esp_deep_sleep_start();
   }
 
-    if (inttemperature > 90.0 && !otaInProgress && tm == 0 && pm == 0) {
-    Serial.println("Device over heated and powersaving mood on");
-    sendMessageTelegram("Device over heated and powersaving mood on");
+  if (inttemperature > 90.0 && !otaInProgress && tm == 0 && pm == 0) {
+    Serial.println("Device over heated and powersaving mode on");
+    sendMessageTelegram("Device over heated and powersaving mode on");
     setCpuFrequencyMhz(80);
     tm = 1;
-  }else
-    {
-      if(inttemperature <= 90.0 && tm == 1 && pm == 0){
+  } else if (inttemperature <= 90.0 && tm == 1 && pm == 0) {
     setCpuFrequencyMhz(240);
     tm = 0;
-    Serial.println("Device cooled down and turning off power saving mood");
-    sendMessageTelegram("Device cooled down and turning off power saving mood");}}
+    Serial.println("Device cooled down and turning off power saving mode");
+    sendMessageTelegram("Device cooled down and turning off power saving mode");
+  }
 
-  timeClient.update(); // Update time
+  timeClient.update();
 
-  // Get current time
-  String formattedTime = timeClient.getFormattedTime();
   int hours = timeClient.getHours();
   int minutes = timeClient.getMinutes();
 
-  // Print the current time
-
-  // Check if the current time is within the event time range
   if ((hours >= 22 || hours < 6) || (hours == 6 && minutes == 0)) {
-    // Event action here
     isScanningActive = false;
-  } else if(scanswitch == 1){
+  } else if (scanswitch == 1) {
     isScanningActive = true;
   }
+
+  // Yield to avoid pegging the loop CPU
+  vTaskDelay(pdMS_TO_TICKS(50));
 }
 
-
 void handleNewMessages(int newMessages) {
-
   for (int i = 0; i < newMessages; i++) {
     String chat_id = String(bot.messages[i].chat_id);
 
@@ -524,495 +482,295 @@ void handleNewMessages(int newMessages) {
     }
 
     String text = bot.messages[i].text;
-    String from_name = bot.messages[i].from_name;
 
     if (text == "/start") {
       sendWelcomeMessage();
-    }
-
-    if (text == "/weather" && pm == 0) {
-      setCpuFrequencyMhz(240);
+    } else if (text == "/weather") {
       sendWeatherInfo();
-    } else {
-      if (text == "/weather" && pm == 1) {
-        setCpuFrequencyMhz(240);
-        delay(500);
-        sendWeatherInfo();
-        delay(1000);
-        setCpuFrequencyMhz(80);
-      }
-    }
-
-    if (text == "/forecast" && pm == 0) {
+    } else if (text == "/forecast") {
       sendForecastInfo();
-    } else {
-      if (text == "/forecast" && pm == 1) {
-        setCpuFrequencyMhz(240);
-        delay(500);
-        sendForecastInfo();
-        delay(1000);
-        setCpuFrequencyMhz(80);
-      }
-    }
-
-    if (text == "/motionsensor_on") {
+    } else if (text == "/motionsensor_on") {
       sendMessageTelegram("motion sensor turned on");
       motionswitch = 1;
       EEPROM.write(7, motionswitch);
       EEPROM.commit();
-      updateBlynkSwitch("V1",1);
-    }
-
-    if (text == "/motionsensor_off") {
+      updateBlynkSwitch("V1", 1);
+    } else if (text == "/motionsensor_off") {
       sendMessageTelegram("motion sensor turned off");
       motionswitch = 0;
       EEPROM.write(7, motionswitch);
       EEPROM.commit();
-      updateBlynkSwitch("V1",0);
-    }
-
-    if (text == "/dht") {
-      sendMessageTelegram("Temperature: " + String(temperature) + " °C" + " , Humidity: " + String(humidity) + " %");
-    }
-
-    if (text == "/battery") {
-      //double voltage = batteryStats.getBatteryVolts();
-      //int chargeLevel = batteryStats.getBatteryChargeLevel(false);  // true for using conversion table
+      updateBlynkSwitch("V1", 0);
+    } else if (text == "/dht") {
+      sendMessageTelegram("Temperature: " + String(temperature) + " °C , Humidity: " + String(humidity) + " %");
+    } else if (text == "/battery") {
       float storedVoltage;
-     EEPROM.get(90, storedVoltage);
-
+      EEPROM.get(90, storedVoltage);
       sendMessageTelegram("Battery Level: " + String(chargeLevel) + " , Battery Voltage: " + String(storedVoltage));
-
-      //sendMessageTelegram("Battery Voltage: " + String(voltage));
-    }
-
-    if (text == "/distance") {
+    } else if (text == "/distance") {
       sendMessageTelegram(String(distance));
-    }
-
-    if (text == "/sonarsensor_on") {
+    } else if (text == "/sonarsensor_on") {
       sendMessageTelegram("sonar sensor turned on");
       sonarswitch = 1;
       EEPROM.write(8, sonarswitch);
       EEPROM.commit();
       sendDataToESP8266();
-    }
-
-    if (text == "/sonarsensor_off") {
+    } else if (text == "/sonarsensor_off") {
       sendMessageTelegram("sonar sensor turned off");
       sonarswitch = 0;
       EEPROM.write(8, sonarswitch);
       EEPROM.commit();
       sendDataToESP8266();
-    }
-
-    if (text == "/batterynotify_on") {
+    } else if (text == "/batterynotify_on") {
       sendMessageTelegram("battery notifications on");
       batteryswitch = 1;
       EEPROM.write(9, batteryswitch);
       EEPROM.commit();
       sendDataToESP8266();
-    }
-
-    if (text == "/batterynotify_off") {
-      sendMessageTelegram("battery notificationa off");
+    } else if (text == "/batterynotify_off") {
+      sendMessageTelegram("battery notifications off");
       batteryswitch = 0;
       EEPROM.write(9, batteryswitch);
       EEPROM.commit();
       sendDataToESP8266();
-    }
-
-    if (text == "/system_info") {
-
+    } else if (text == "/system_info") {
       float inttemperature = temperatureRead();
-
-      String welcome = "CPU Frequency (MHz): " + String((float)ESP.getCpuFreqMHz()) + "\n";
-      welcome += "Free RAM (kB): " + String(ESP.getFreeHeap() / 1024) + "\n";
-      welcome += "Total RAM (kB): " + String(ESP.getHeapSize() / 1024) + "\n";
-      welcome += "RAM Usage  : " + String((ESP.getHeapSize() - ESP.getFreeHeap()) / (float)ESP.getHeapSize() * 100) + " %" + "\n";
-      welcome += "CPU Temperature  : " + String(inttemperature) + " C" + "\n";
-
-      // Send the welcome message to Telegram
-      bot.sendMessage(CHAT_ID, welcome, "");
-    }
-    if (text == "/sleep" && lastsleep >= 1) {
-      sendMessageTelegram("deep sleep starting for 5 minutes");
-      EEPROM.write(SLEEPADDR, 0);  // Store the message ID
-      EEPROM.commit();
-      lastsleep = EEPROM.read(SLEEPADDR);
-      esp_sleep_enable_timer_wakeup(300 * tf);
-      esp_deep_sleep_start();
-    }
-
-    else {
-      if (text == "/sleep" && lastsleep == 0) {
-        EEPROM.write(SLEEPADDR, 1);  // Store the message ID
+      String info = "CPU Frequency (MHz): " + String((float)ESP.getCpuFreqMHz()) + "\n";
+      info += "Free RAM (kB): " + String(ESP.getFreeHeap() / 1024) + "\n";
+      info += "Total RAM (kB): " + String(ESP.getHeapSize() / 1024) + "\n";
+      info += "RAM Usage  : " + String((ESP.getHeapSize() - ESP.getFreeHeap()) / (float)ESP.getHeapSize() * 100) + " %\n";
+      info += "CPU Temperature  : " + String(inttemperature) + " C\n";
+      bot.sendMessage(CHAT_ID, info, "");
+    } else if (text == "/sleep") {
+      if (lastsleep >= 1) {
+        sendMessageTelegram("deep sleep starting for 5 minutes");
+        EEPROM.write(SLEEPADDR, 0);
         EEPROM.commit();
-        lastsleep = EEPROM.read(SLEEPADDR);
-        //Serial.println("lastsleep status :");
-        //Serial.println(lastsleep);
-        continue;
-      }
-    }
-
-
-    if (text == "/reset" && lastsleep >= 1) {
-      sendMessageTelegram("resetting");
-      EEPROM.write(SLEEPADDR, 0);  // Store the message ID
-      EEPROM.commit();
-      lastsleep = EEPROM.read(SLEEPADDR);
-      //Serial.println("lastsleep status :");
-      //Serial.println(lastsleep);
-      EEPROM.write(7, 0);
-      EEPROM.write(8, 0);
-      EEPROM.write(9, 0);
-      EEPROM.write(10, 0);
-      EEPROM.write(11, 0);
-      EEPROM.write(12, 0);
-      EEPROM.commit();
-      resetWiFiSettings();  // Reset WiFi credentials if button is held for more than 5 seconds
-      ESP.restart();
-    }
-
-    else {
-      if (text == "/reset" && lastsleep == 0) {
-        EEPROM.write(SLEEPADDR, 1);  // Store the message ID
+        lastsleep = 0;
+        esp_sleep_enable_timer_wakeup(300 * tf);
+        esp_deep_sleep_start();
+      } else {
+        EEPROM.write(SLEEPADDR, 1);
         EEPROM.commit();
-        lastsleep = EEPROM.read(SLEEPADDR);
-        //Serial.println("lastsleep status :");
-        //Serial.println(lastsleep);
-        continue;
+        lastsleep = 1;
       }
-    }
-
-
-
-    if (text == "/restart" && lastsleep >= 1) {
-      sendMessageTelegram("restarting");
-      EEPROM.write(SLEEPADDR, 0);  // Store the message ID
-      EEPROM.commit();
-      lastsleep = EEPROM.read(SLEEPADDR);
-      //Serial.println("lastsleep status :");
-      //Serial.println(lastsleep);
-      ESP.restart();
-    }
-
-    else {
-      if (text == "/restart" && lastsleep == 0) {
-        EEPROM.write(SLEEPADDR, 1);  // Store the message ID
+    } else if (text == "/reset") {
+      if (lastsleep >= 1) {
+        sendMessageTelegram("resetting");
+        EEPROM.write(SLEEPADDR, 0);
+        EEPROM.write(7, 0);
+        EEPROM.write(8, 0);
+        EEPROM.write(9, 0);
+        EEPROM.write(10, 0);
+        EEPROM.write(11, 0);
+        EEPROM.write(12, 0);
         EEPROM.commit();
-        lastsleep = EEPROM.read(SLEEPADDR);
-        //Serial.println("lastsleep status :");
-        //Serial.println(lastsleep);
-        continue;
+        resetWiFiSettings();
+        ESP.restart();
+      } else {
+        EEPROM.write(SLEEPADDR, 1);
+        EEPROM.commit();
+        lastsleep = 1;
       }
-    }
-    if (text == "/weather_notify_on") {
+    } else if (text == "/restart") {
+      if (lastsleep >= 1) {
+        sendMessageTelegram("restarting");
+        EEPROM.write(SLEEPADDR, 0);
+        EEPROM.commit();
+        ESP.restart();
+      } else {
+        EEPROM.write(SLEEPADDR, 1);
+        EEPROM.commit();
+        lastsleep = 1;
+      }
+    } else if (text == "/weather_notify_on") {
       sendMessageTelegram("Weather notifications on");
       weatherswitch = 1;
       EEPROM.write(10, weatherswitch);
       EEPROM.commit();
-    }
-
-    if (text == "/weather_notify_off") {
+    } else if (text == "/weather_notify_off") {
       sendMessageTelegram("Weather notifications off");
       weatherswitch = 0;
       EEPROM.write(10, weatherswitch);
       EEPROM.commit();
-    }
-    if (text == "/powersavingmode_on") {
+    } else if (text == "/powersavingmode_on") {
       pm = 1;
       EEPROM.write(70, pm);
       EEPROM.commit();
       setCpuFrequencyMhz(80);
-      sendMessageTelegram("powersavingmode on");
-    }
-
-    if (text == "/powersavingmode_off") {
+      sendMessageTelegram("powersaving mode on");
+    } else if (text == "/powersavingmode_off") {
       pm = 0;
       EEPROM.write(70, pm);
       EEPROM.commit();
       sendMessageTelegram("powersaving mode off");
       setCpuFrequencyMhz(240);
-    }
-
-    
-    if (text == "/scanningdevicese_on") {
+    } else if (text == "/scanningdevicese_on") {
       isScanningActive = true;
       scanswitch = 1;
-      vTaskSuspend(task2TaskHandle);
-      delay(1000);
-        EEPROM.write(60, isScanningActive);
-        EEPROM.write(80, scanswitch);
-        EEPROM.commit();  // Ensure the data is written
-      vTaskResume(task2TaskHandle);
+      EEPROM.write(60, 1);
+      EEPROM.write(80, 1);
+      EEPROM.commit();
       sendMessageTelegram("Scanning devices active");
-    }
-
-    if (text == "/scanningdevicese_off") {
+    } else if (text == "/scanningdevicese_off") {
       isScanningActive = false;
       scanswitch = 0;
-      vTaskSuspend(task2TaskHandle);
-        EEPROM.write(60, isScanningActive);
-        EEPROM.write(80, scanswitch);
-        EEPROM.commit();  // Ensure the data is written
+      EEPROM.write(60, 0);
+      EEPROM.write(80, 0);
+      EEPROM.commit();
       sendMessageTelegram("Scanning devices turned off");
     }
-    
-    
   }
-  //Serial.println("Reading telegram messages successfully");
 }
 
-
 void sendWelcomeMessage() {
-  String from_name = "User";  // This can be a placeholder as you may not have the user's name in this context
-  String welcome = "Welcome, " + from_name + ".\n\n";
+  String welcome = "Welcome to ESP Weather BOT.\n\n";
   welcome += "Below are the status of the switches:\n\n";
   welcome += "Motion switch status: " + String(motionswitch) + "\n";
   welcome += "Sonar switch status: " + String(sonarswitch) + "\n";
   welcome += "Battery switch status: " + String(batteryswitch) + "\n";
-  welcome += "devicescan switch status: " + String(isScanningActive) + "\n";
-  welcome += "powersaving mood status: " + String(pm) + "\n";
-  welcome += "weather switch status: " + String(weatherswitch) + "\n\n";
+  welcome += "Device scan switch status: " + String(isScanningActive) + "\n";
+  welcome += "Powersaving mode status: " + String(pm) + "\n";
+  welcome += "Weather switch status: " + String(weatherswitch) + "\n\n";
   welcome += "Use the following commands to control the system:\n\n";
-  welcome += "/start to recieve welcome message\n";
-  welcome += "/reset to reset device\n";
-  welcome += "/restart to restart device\n";
-  welcome += "/weather to get the current weather\n";
-  welcome += "/forecast to get weather forecast\n";
-  welcome += "/motionsensor_on to turn ON motion sensor\n";
-  welcome += "/motionsensor_off to turn OFF motion sensor\n";
-  welcome += "/dht to get temperature and humidity\n";
-  welcome += "/battery to get battery info\n";
-  welcome += "/distance to get distance info\n";
-  welcome += "/sonarsensor_on to turn ON sonar sensor\n";
-  welcome += "/sonarsensor_off to turn OFF sonar sensor\n";
-  welcome += "/batterynotify_on to turn ON battery status notifications\n";
-  welcome += "/batterynotify_off to turn OFF battery status notifications\n";
-  welcome += "/weather_notify_on to turn ON weather notifications\n";
-  welcome += "/weather_notify_off to turn OFF weather notifications\n";
-  welcome += "/scanningdevicese_on to turn on scanning devices\n";
-  welcome += "/scanningdevicese_off to turn off scanning devices\n";
-  welcome += "/system_info get CPU speed and RAM Usage\n";
-  welcome += "/sleep to deep sleep the divide for 5 minutes\n";
-  welcome += "/powersavingmode_off to turn off powersaving mode\n";
-  welcome += "/powersavingmode_on to turn on powersaving mode\n";
-  // Send the welcome message to Telegram
+  welcome += "/start - receive welcome message\n";
+  welcome += "/reset - reset device\n";
+  welcome += "/restart - restart device\n";
+  welcome += "/weather - get the current weather\n";
+  welcome += "/forecast - get weather forecast\n";
+  welcome += "/motionsensor_on - turn ON motion sensor\n";
+  welcome += "/motionsensor_off - turn OFF motion sensor\n";
+  welcome += "/dht - get temperature and humidity\n";
+  welcome += "/battery - get battery info\n";
+  welcome += "/distance - get distance info\n";
+  welcome += "/sonarsensor_on - turn ON sonar sensor\n";
+  welcome += "/sonarsensor_off - turn OFF sonar sensor\n";
+  welcome += "/batterynotify_on - turn ON battery status notifications\n";
+  welcome += "/batterynotify_off - turn OFF battery status notifications\n";
+  welcome += "/weather_notify_on - turn ON weather notifications\n";
+  welcome += "/weather_notify_off - turn OFF weather notifications\n";
+  welcome += "/scanningdevicese_on - turn on scanning devices\n";
+  welcome += "/scanningdevicese_off - turn off scanning devices\n";
+  welcome += "/system_info - get CPU speed and RAM Usage\n";
+  welcome += "/sleep - deep sleep the device for 5 minutes\n";
+  welcome += "/powersavingmode_off - turn off powersaving mode\n";
+  welcome += "/powersavingmode_on - turn on powersaving mode\n";
+
   bot.sendMessage(CHAT_ID, welcome, "");
 }
 
-
 void connectToWiFi() {
-  WiFiManager wifiManager;
-  wifiManager.setTimeout(1200000000000000000000);  // Wait for 2 minutes before falling back to AP mode
+  // 120 seconds timeout for configuration portal before fallback
+  wifiManager.setTimeout(120);
 
   if (!WiFi.config(staticIP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("STA Failed to configure");
+    Serial.println("STA Failed to configure Static IP");
   }
+
   if (!WiFi.isConnected()) {
     if (!wifiManager.autoConnect("MotionSensorAP")) {
       Serial.println("Failed to connect to WiFi after timeout. Restarting ESP...");
-      delay(5000);    // Wait a little before restarting
-      ESP.restart();  // Restart the ESP if it cannot connect
+      delay(5000);
+      ESP.restart();
     }
   }
 
-  // If connected, print the IP address
   if (WiFi.isConnected()) {
     Serial.println("Connected to WiFi. IP: " + WiFi.localIP().toString());
   }
-
 }
 
 void resetWiFiSettings() {
-  wifiManager.resetSettings();  // Erase WiFi credentials
+  wifiManager.resetSettings();
   sendMessageTelegram("WiFi settings have been reset.");
 }
 
-
-
-
-//////////weather loops
-
-
 void checkWeather() {
-  /* if (!heartbeatReceived) {
-    vTaskDelete(core0TaskHandle);
-    xTaskCreatePinnedToCore(core0Task, "Core0Task", 10000, NULL, 1, &core0TaskHandle, 0);
-  }
-  if (!heartbeat1Received) {
-    vTaskDelete(core1TaskHandle);
-    xTaskCreatePinnedToCore(core1Task, "Core1Task", 10000, NULL, 1, &core1TaskHandle, 1);
-  } */
-  if (pm == 1) { setCpuFrequencyMhz(240); }
   if (WiFi.status() == WL_CONNECTED && weatherswitch == 1) {
     HTTPClient http;
-
-    // Get current weather data
-    String currentWeatherUrl = String(weatherApiUrl) + "?key=" + weatherApiKey + "&q=" + city + "&aqi=no";
+    String currentWeatherUrl = String(weatherApiUrl) + "?key=" + String(weatherApiKey) + "&q=" + String(city) + "&aqi=no";
     http.begin(currentWeatherUrl);
+    http.setTimeout(5000);
     int httpCode = http.GET();
 
     if (httpCode > 0) {
       String currentWeatherPayload = http.getString();
-      Serial.println("weather checked");  // Print current weather response
+      Serial.println("weather checked");
 
-      // Parse the weather data
       DynamicJsonDocument currentDoc(1024);
-      deserializeJson(currentDoc, currentWeatherPayload);
       DeserializationError error = deserializeJson(currentDoc, currentWeatherPayload);
 
       if (error) {
         Serial.print("JSON deserialization failed: ");
         Serial.println(error.c_str());
         http.end();
-        return;  // Exit if parsing fails
+        return;
       }
 
       const char* currentWeatherCondition = currentDoc["current"]["condition"]["text"];
       float currentPrecipitation = currentDoc["current"]["precip_mm"];
 
-      // Check if it is raining
       if (String(currentWeatherCondition).indexOf("rain") != -1 && currentPrecipitation > 0) {
         if (!raining) {
           raining = true;
-          EEPROM.write(11, raining ? 1 : 0);  // Write '1' for true, '0' for false
+          EEPROM.write(11, 1);
           EEPROM.commit();
-          vTaskSuspend(task2TaskHandle);
-          vTaskSuspend(task3TaskHandle);
-          Serial.println(raining ? "true" : "false");
           Serial.println("Alert: It's raining now!");
           sendMessageWhatsApp("Alert: It's raining now!");
-          delay(1000);
           logEvent("rain", "Alert: It's raining now!");
-          delay(1000);
-          vTaskResume(task2TaskHandle);
-          vTaskResume(task3TaskHandle);
         }
       } else {
         if (raining) {
           raining = false;
-          EEPROM.write(11, raining ? 1 : 0);  // Write '1' for true, '0' for false
+          EEPROM.write(11, 0);
           EEPROM.commit();
-           vTaskSuspend(task2TaskHandle);
-          vTaskSuspend(task3TaskHandle);
-          Serial.println(raining ? "true" : "false");
           Serial.println("Alert: Rain has stopped!");
           sendMessageWhatsApp("Alert: The rain has stopped!");
-          delay(1000);
-          logEvent("rain", "Alert: The rain has stopped!E");
-          delay(1000);
-          vTaskResume(task2TaskHandle);
-          vTaskResume(task3TaskHandle);
+          logEvent("rain", "Alert: The rain has stopped!");
         }
       }
-
-
-
     } else {
       Serial.println("Error getting current weather");
     }
     http.end();
-
-    /*
-    // Step 2: Get weather forecast data
-    String forecastWeatherUrl = String(forecastApiUrl) + "?key=" + weatherApiKey + "&q=" + city + "&days=1&aqi=no";
-    http.begin(forecastWeatherUrl);
-    httpCode = http.GET();
-
-    if (httpCode > 0) {
-    String forecastWeatherPayload = http.getString();
-    Parse the forecast weather data
-    DynamicJsonDocument forecastDoc(8192);
-    deserializeJson(forecastDoc, forecastWeatherPayload);
-      DeserializationError error = deserializeJson(forecastDoc, forecastWeatherPayload);
-
-      if (error) {
-        Serial.print("JSON deserialization failed for forecast: ");
-        Serial.println(error.c_str());
-        http.end();
-        return;
-      }
-
-      // Check for rain in the forecast (assume checking next 24 hours)
-      bool futureRain = false;
-      String rainTime = "";           // To store the time of future rain
-      for (int i = 0; i < 24; i++) {  // Loop through 24 hours forecast
-        const char* futureCondition = forecastDoc["forecast"]["forecastday"][0]["hour"][i]["condition"]["text"];
-        float futurePrecipitation = forecastDoc["forecast"]["forecastday"][0]["hour"][i]["precip_mm"];
-        const char* timeOfRain = forecastDoc["forecast"]["forecastday"][0]["hour"][i]["time"].as<const char*>();  // Get time
-
-        if (String(futureCondition).indexOf("rain") != -1 && futurePrecipitation > 0) {
-          futureRain = true;
-          rainTime = String(timeOfRain);  // Save the time of rain
-          break;
-        }
-      }
-
-      // Handle future rain alert
-      if (futureRain && !rainForecasted) {
-        rainForecasted = true;
-        EEPROM.write(12, rainForecasted ? 1 : 0);
-        EEPROM.commit();
-        String alertMessage = "🌧 Alert: Rain is forecasted at " + rainTime + "!";
-        Serial.println(alertMessage);
-        sendMessageWhatsApp(alertMessage);
-        delay(1000);
-        Blynk.logEvent("rainforecast");
-      } else if (!futureRain && rainForecasted) {
-        rainForecasted = false;
-        EEPROM.write(12, rainForecasted ? 1 : 0);
-        EEPROM.commit();
-        Serial.println("Alert: No rain forecasted.");
-      }
-    } else {
-      Serial.println("Error getting forecast weather");
-    }
-    http.end();
-    */
   }
-  if (pm == 1) { setCpuFrequencyMhz(80); }
 }
 
 void sendWeatherInfo() {
-  //esp_task_wdt_reset();
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    String currentWeatherUrl = String(weatherApiUrl) + "?key=" + weatherApiKey + "&q=" + city + "&aqi=no";
+    String currentWeatherUrl = String(weatherApiUrl) + "?key=" + String(weatherApiKey) + "&q=" + String(city) + "&aqi=no";
     http.begin(currentWeatherUrl);
+    http.setTimeout(5000);
     int httpCode = http.GET();
 
     if (httpCode > 0) {
       String payload = http.getString();
-      //Serial.println(payload);  // For debugging
 
-      // Parse JSON response
       DynamicJsonDocument doc(2048);
-      deserializeJson(doc, payload);
+      DeserializationError error = deserializeJson(doc, payload);
 
-      // Extract data
-      String location = doc["location"]["name"].as<String>() + ", " + doc["location"]["country"].as<String>();
-      String condition = doc["current"]["condition"]["text"].as<String>();
-      float tempC = doc["current"]["temp_c"].as<float>();
-      float feelsLikeC = doc["current"]["feelslike_c"].as<float>();
-      float humidity = doc["current"]["humidity"].as<float>();
-      float precipitation = doc["current"]["precip_mm"].as<float>();
-      String windDir = doc["current"]["wind_dir"].as<String>();
-      float windSpeed = doc["current"]["wind_kph"].as<float>();
+      if (!error) {
+        String location = doc["location"]["name"].as<String>() + ", " + doc["location"]["country"].as<String>();
+        String condition = doc["current"]["condition"]["text"].as<String>();
+        float tempC = doc["current"]["temp_c"].as<float>();
+        float feelsLikeC = doc["current"]["feelslike_c"].as<float>();
+        float hum = doc["current"]["humidity"].as<float>();
+        float precipitation = doc["current"]["precip_mm"].as<float>();
+        String windDir = doc["current"]["wind_dir"].as<String>();
+        float windSpeed = doc["current"]["wind_kph"].as<float>();
 
-      // Format message
-      String message = "🌍 *Weather Update*\n";
-      message += "📍 Location: " + location + "\n";
-      message += "🌦 Condition: " + condition + "\n";
-      message += "🌡 Temperature: " + String(tempC) + " °C\n";
-      message += "🌀 Feels Like: " + String(feelsLikeC) + " °C\n";
-      message += "💧 Humidity: " + String(humidity) + " %\n";
-      message += "🌧 Precipitation: " + String(precipitation) + " mm\n";
-      message += "💨 Wind: " + String(windSpeed) + " kph, " + windDir + "\n";
+        String message = "🌍 *Weather Update*\n";
+        message += "📍 Location: " + location + "\n";
+        message += "🌦 Condition: " + condition + "\n";
+        message += "🌡 Temperature: " + String(tempC) + " °C\n";
+        message += "🌀 Feels Like: " + String(feelsLikeC) + " °C\n";
+        message += "💧 Humidity: " + String(hum) + " %\n";
+        message += "🌧 Precipitation: " + String(precipitation) + " mm\n";
+        message += "💨 Wind: " + String(windSpeed) + " kph, " + windDir + "\n";
 
-      // Send message
-      bot.sendMessage(CHAT_ID, message, "Markdown");
+        bot.sendMessage(CHAT_ID, message, "Markdown");
+      }
     } else {
       Serial.println("Error getting current weather");
     }
@@ -1023,31 +781,49 @@ void sendWeatherInfo() {
 }
 
 void sendForecastInfo() {
-  if (pm == 1) { setCpuFrequencyMhz(240); }
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    String forecastUrl = String(forecastApiUrl) + "?key=" + weatherApiKey + "&q=" + city + "&days=1&aqi=no&alerts=no";
-    
+    String forecastUrl = String(forecastApiUrl) + "?key=" + String(weatherApiKey) + "&q=" + String(city) + "&days=1&aqi=no&alerts=no";
+
     http.begin(forecastUrl);
-    http.setTimeout(5000);  // Optional: Set a timeout to avoid long waits
-    
+    http.setTimeout(5000);
+
     int httpCode = http.GET();
 
     if (httpCode > 0) {
       String payload = http.getString();
 
-      // Parse JSON response
-      DynamicJsonDocument doc(30000);  // Adjust based on response size
-      DeserializationError error = deserializeJson(doc, payload);
+      // ArduinoJson filter reduces memory needed from 30,000 bytes down to ~4KB
+      StaticJsonDocument<512> filter;
+      filter["location"]["name"] = true;
+      filter["location"]["country"] = true;
+      filter["forecast"]["forecastday"][0]["date"] = true;
+      JsonObject day = filter["forecast"]["forecastday"][0]["day"];
+      day["condition"]["text"] = true;
+      day["maxtemp_c"] = true;
+      day["mintemp_c"] = true;
+      day["maxtemp_f"] = true;
+      day["mintemp_f"] = true;
+      day["totalprecip_mm"] = true;
+      day["avghumidity"] = true;
+      day["maxwind_kph"] = true;
+      JsonObject hour = filter["forecast"]["forecastday"][0]["hour"][0];
+      hour["time"] = true;
+      hour["condition"]["text"] = true;
+      hour["temp_c"] = true;
+      hour["temp_f"] = true;
+      hour["precip_mm"] = true;
+
+      DynamicJsonDocument doc(4096);
+      DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
 
       if (error) {
         Serial.print("JSON deserialization failed: ");
         Serial.println(error.c_str());
-        http.end();  // Ensure connection is closed on failure
+        http.end();
         return;
       }
 
-      // Extract daily forecast data
       String location = doc["location"]["name"].as<String>() + ", " + doc["location"]["country"].as<String>();
       String forecastDate = doc["forecast"]["forecastday"][0]["date"].as<String>();
       String condition = doc["forecast"]["forecastday"][0]["day"]["condition"]["text"].as<String>();
@@ -1056,10 +832,9 @@ void sendForecastInfo() {
       float maxTempF = doc["forecast"]["forecastday"][0]["day"]["maxtemp_f"].as<float>();
       float minTempF = doc["forecast"]["forecastday"][0]["day"]["mintemp_f"].as<float>();
       float precipitation = doc["forecast"]["forecastday"][0]["day"]["totalprecip_mm"].as<float>();
-      float humidity = doc["forecast"]["forecastday"][0]["day"]["avghumidity"].as<float>();
+      float hum = doc["forecast"]["forecastday"][0]["day"]["avghumidity"].as<float>();
       float windSpeed = doc["forecast"]["forecastday"][0]["day"]["maxwind_kph"].as<float>();
 
-      // Format message for the daily forecast
       String message = "🌍 *Weather Forecast*\n";
       message += "📍 Location: " + location + "\n";
       message += "📅 Date: " + forecastDate + "\n";
@@ -1067,100 +842,77 @@ void sendForecastInfo() {
       message += "🌡 Max Temp: " + String(maxTempC, 1) + " °C (" + String(maxTempF, 1) + " °F)\n";
       message += "🌡 Min Temp: " + String(minTempC, 1) + " °C (" + String(minTempF, 1) + " °F)\n";
       message += "💧 Precipitation: " + String(precipitation, 1) + " mm\n";
-      message += "💧 Humidity: " + String(humidity, 2) + " %\n";
+      message += "💧 Humidity: " + String(hum, 2) + " %\n";
       message += "💨 Max Wind Speed: " + String(windSpeed, 1) + " kph\n";
 
-      // Extract and format hourly forecast data
       String hourlyForecast = "\n🕒 *Hourly Forecast*:\n";
-      for (int z = 0; z < doc["forecast"]["forecastday"][0]["hour"].size(); z++) {
-        String time = doc["forecast"]["forecastday"][0]["hour"][z]["time"].as<String>();
-        String hourCondition = doc["forecast"]["forecastday"][0]["hour"][z]["condition"]["text"].as<String>();
-        float hourTempC = doc["forecast"]["forecastday"][0]["hour"][z]["temp_c"].as<float>();
-        float hourTempF = doc["forecast"]["forecastday"][0]["hour"][z]["temp_f"].as<float>();
-        float hourPrecipitation = doc["forecast"]["forecastday"][0]["hour"][z]["precip_mm"].as<float>();
+      JsonArray hoursArr = doc["forecast"]["forecastday"][0]["hour"].as<JsonArray>();
+      int hourIdx = 1;
+      for (JsonObject h : hoursArr) {
+        String time = h["time"].as<String>();
+        String hourCondition = h["condition"]["text"].as<String>();
+        float hourTempC = h["temp_c"].as<float>();
+        float hourTempF = h["temp_f"].as<float>();
+        float hourPrecipitation = h["precip_mm"].as<float>();
 
-        hourlyForecast += String(z + 1) + ". " + time + ": " + hourCondition + "\n";
+        hourlyForecast += String(hourIdx++) + ". " + time + ": " + hourCondition + "\n";
         hourlyForecast += "   🌡 Temp: " + String(hourTempC, 1) + " °C (" + String(hourTempF, 1) + " °F)\n";
-        hourlyForecast += "   💧 Precipitation: " + String(hourPrecipitation, 1) + " mm\n";
-        hourlyForecast += "\n";
+        hourlyForecast += "   💧 Precipitation: " + String(hourPrecipitation, 1) + " mm\n\n";
       }
 
       message += hourlyForecast;
 
-      // Send message
       bot.sendMessage(CHAT_ID, message, "Markdown");
       Serial.println("forecast sent");
     } else {
       Serial.print("Error getting weather forecast, code: ");
-      Serial.println(httpCode);  // Provide exact error code
+      Serial.println(httpCode);
     }
-    http.end();  // Close connection
+    http.end();
   } else {
     Serial.println("WiFi not connected");
   }
-  if (pm == 1) { setCpuFrequencyMhz(80); }
 }
 
+// Fast, non-blocking URL encoder without busy-wait delay
+String customUrlEncode(const String &str) {
+  String encodedString;
+  encodedString.reserve(str.length() * 3 / 2);
+  const char hexChars[] = "0123456789ABCDEF";
 
-////////////////////////////////////////////
-
-
-
-
-
-String customUrlEncode(String str) {
-  String encodedString = "";
-  char c;
-  char code0;
-  char code1;
-  char code2;
-  for (int j = 0; j < str.length(); j++) {
-    c = str.charAt(j);
-    if (c == ' ') {
-      encodedString += '+';
-    } else if (isalnum(c)) {
+  for (size_t j = 0; j < str.length(); j++) {
+    char c = str.charAt(j);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
       encodedString += c;
+    } else if (c == ' ') {
+      encodedString += '+';
     } else {
-      code1 = (c & 0xf) + '0';
-      if ((c & 0xf) > 9) {
-        code1 = (c & 0xf) - 10 + 'A';
-      }
-      c = (c >> 4) & 0xf;
-      code0 = c + '0';
-      if (c > 9) {
-        code0 = c - 10 + 'A';
-      }
-      code2 = '\0';
       encodedString += '%';
-      encodedString += code0;
-      encodedString += code1;
+      encodedString += hexChars[(c >> 4) & 0x0F];
+      encodedString += hexChars[c & 0x0F];
     }
-    delay(10);
   }
   return encodedString;
 }
 
-
 void sendDataToESP8266() {
   if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;  // Create a WiFi client
+    WiFiClient peerClient;
     HTTPClient http;
     String url = "http://" + String(serverIP) + ":" + String(port) + "/data";
 
-    // Use the newer HTTPClient::begin() method with WiFiClient
-    http.begin(client, url);
+    http.begin(peerClient, url);
+    http.setTimeout(4000);
     http.addHeader("Content-Type", "application/json");
 
-    // Prepare the JSON data
     String jsonData = "{\"sonarswitch\": " + String(sonarswitch) + ", \"batteryswitch\": " + String(batteryswitch) + "}";
-
     int httpResponseCode = http.POST(jsonData);
 
     if (httpResponseCode > 0) {
       String response = http.getString();
       Serial.println("ESP32 received response: " + response);
     } else {
-      Serial.println("ESP32: Error in HTTP request");
+      Serial.println("ESP32: Error in HTTP request to ESP8266");
     }
 
     http.end();
@@ -1172,8 +924,7 @@ void handleReceiveData() {
     String body = server.arg("plain");
     Serial.println("ESP32 received data: " + body);
 
-    // Parse the received JSON
-    DynamicJsonDocument doc(200);
+    DynamicJsonDocument doc(256);
     DeserializationError error = deserializeJson(doc, body);
 
     if (!error) {
@@ -1182,10 +933,12 @@ void handleReceiveData() {
       motionsense = doc["motionsense"];
       distance = doc["distance"];
       motionswitch = doc["motionswitch"];
-      float voltage = doc["voltage"];
+      float volt = doc["voltage"];
       chargeLevel = doc["chargeLevel"];
-     EEPROM.put(90, voltage);
+      voltage = volt;
+      EEPROM.put(90, voltage);
       EEPROM.commit();
+
       Serial.println("Parsed temperature: " + String(temperature));
       Serial.println("Parsed humidity: " + String(humidity));
       Serial.println("Parsed motionsense: " + String(motionsense));
@@ -1205,111 +958,83 @@ void handleReceiveData() {
 
 void sendMessageTelegram(String message) {
   bot.sendMessage(CHAT_ID, message, "");
-  //Serial.println("telegram message sent successfully");
 }
 
 void sendMessageWhatsApp(String message) {
-  const int maxRetries = 10;  // Set maximum number of retries
-  int retryCount = 0;        // Initialize retry counter
-  int httpResponseCode = 0;  // HTTP response code
+  const int maxRetries = 3;
+  int retryCount = 0;
 
   while (retryCount < maxRetries) {
     String url = "https://api.callmebot.com/whatsapp.php?phone=" + MobileNumber + "&apikey=" + APIKey + "&text=" + customUrlEncode(message);
 
     HTTPClient http;
     http.begin(url);
+    http.setTimeout(5000);
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
-    // Send the POST request and capture response
-    httpResponseCode = http.POST(url);
+    int httpResponseCode = http.POST(url);
 
     if (httpResponseCode == 200) {
       Serial.println("WhatsApp message sent successfully");
       http.end();
-      return;  // Exit the function if the message is sent successfully
+      return;
     } else {
       Serial.println("Error sending WhatsApp message. HTTP response code: " + String(httpResponseCode));
-      retryCount++;  // Increment retry counter
-      Serial.println("Retry attempt: " + String(retryCount));
-      
+      retryCount++;
       if (retryCount < maxRetries) {
-        delay(3000);  // Wait for 2 seconds before retrying
+        vTaskDelay(pdMS_TO_TICKS(1500));
       } else {
-        Serial.println("Max retries reached. Message sending failed.");
+        Serial.println("Max retries reached. WhatsApp message sending failed.");
       }
     }
-
-    http.end();  // Close the HTTP connection
+    http.end();
   }
-}
-
-
-void blink() {
-  // Turn the LED on (HIGH is the voltage level)
-  digitalWrite(LED_PIN, HIGH);
-  delay(200);  // Wait for a second
-
-  // Turn the LED off (LOW is the voltage level)
-  digitalWrite(LED_PIN, LOW);
-  delay(600);  // Wait for a second
 }
 
 void updateBlynkSwitch(String virtualPin, int value) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    WiFiClient client;
-   //vTaskSuspend(task2TaskHandle);
-   //vTaskSuspend(task3TaskHandle);
+    WiFiClient blynkClient;
 
-    // Construct the URL to update the Blynk virtual pin
-    String url = "http://blynk.cloud/external/api/update?token=03zI8D5cFgAi06em8E8mm1x_Ps6nobsS&pin=" + virtualPin + "&value=" + String(value);
+    String url = "http://blynk.cloud/external/api/update?token=" + String(BLYNK_AUTH_TOKEN) + "&pin=" + virtualPin + "&value=" + String(value);
 
-    Serial.println("URL: " + url);
+    http.begin(blynkClient, url);
+    http.setTimeout(4000);
+    http.addHeader("Content-Type", "application/json");
 
-    http.begin(client, url);  // Start the connection
-    http.addHeader("Content-Type", "application/json");  // Add JSON header
-
-    // Send the request
     int httpResponseCode = http.GET();
-
     if (httpResponseCode > 0) {
       String response = http.getString();
-      Serial.println("Response: " + response);
+      Serial.println("Blynk update response: " + response);
     } else {
-      Serial.println("Error on sending request: " + String(httpResponseCode));
+      Serial.println("Error sending Blynk update: " + String(httpResponseCode));
     }
-
-    http.end();  // Close the connection
+    http.end();
   } else {
     Serial.println("WiFi not connected");
   }
-    // vTaskResume(task2TaskHandle);
-   //vTaskResume(task3TaskHandle);
 }
 
 void logEvent(String code, String description) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    WiFiClient client;
+    WiFiClient blynkClient;
 
-    // Construct the URL for sending the log event
-   String url = String("http://blynk.cloud/external/api/logEvent?token=03zI8D5cFgAi06em8E8mm1x_Ps6nobsS") + "&code=" + code + "&description=" + customUrlEncode(description);
+    String url = String("http://blynk.cloud/external/api/logEvent?token=") + String(BLYNK_AUTH_TOKEN) + "&code=" + code + "&description=" + customUrlEncode(description);
 
-    
-    http.begin(client, url);  // Start connection to the server
-    
-    int httpResponseCode = http.GET();  // Send the GET request
+    http.begin(blynkClient, url);
+    http.setTimeout(4000);
 
-    // Check the response
+    int httpResponseCode = http.GET();
     if (httpResponseCode > 0) {
       String response = http.getString();
-      Serial.println("Response: " + response);
+      Serial.println("Blynk logEvent response: " + response);
     } else {
-      Serial.println("Error sending request: " + String(httpResponseCode));
+      Serial.println("Error sending Blynk logEvent: " + String(httpResponseCode));
     }
-
-    http.end();  // Close connection
+    http.end();
   } else {
     Serial.println("WiFi not connected");
   }
+}
 }
